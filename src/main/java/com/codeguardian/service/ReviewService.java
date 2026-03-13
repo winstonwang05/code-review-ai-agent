@@ -4,6 +4,7 @@ import com.codeguardian.dto.FileContentDTO;
 import com.codeguardian.dto.ReviewRequestDTO;
 import com.codeguardian.dto.ReviewResponseDTO;
 import com.codeguardian.entity.Finding;
+import com.codeguardian.entity.ReviewReport;
 import com.codeguardian.entity.ReviewTask;
 import com.codeguardian.enums.CategoryEnum;
 import com.codeguardian.enums.ReviewTypeEnum;
@@ -11,7 +12,9 @@ import com.codeguardian.enums.SeverityEnum;
 import com.codeguardian.enums.TaskStatusEnum;
 import com.codeguardian.repository.FindingRepository;
 import com.codeguardian.repository.ReviewTaskRepository;
+import com.codeguardian.repository.ReviewReportRepository;
 import com.codeguardian.service.rules.RuleEngineService;
+import com.codeguardian.service.rag.MinioStorageService;
 import com.codeguardian.util.ReviewTaskUtils;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
@@ -42,20 +45,25 @@ import java.util.stream.Collectors;
 public class ReviewService {
     private final ReviewTaskRepository taskRepository;
     private final FindingRepository findingRepository;
+    private final ReviewReportRepository reportRepository;
     private final AIModelService aiModelService;
     private final CodeParserService codeParserService;
     private final RuleEngineService ruleEngineService;
     private final SystemConfigService configService;
     private final GitService gitService;
+    private final MinioStorageService minioStorageService;
+    private final ReportService reportService;
 
     private final ExecutorService executor = Executors.newFixedThreadPool(20);
     private final ExecutorService orchestrationExecutor = Executors.newCachedThreadPool();
+    private final ExecutorService uploadExecutor = Executors.newFixedThreadPool(5);
 
     @jakarta.annotation.PreDestroy
     public void destroy() {
         log.info("Closing review service executors...");
         executor.shutdown();
         orchestrationExecutor.shutdown();
+        uploadExecutor.shutdown();
     }
     /**
      * 创建审查任务并开始审查
@@ -129,6 +137,8 @@ public class ReviewService {
                 // 设置状态
                 finalTask.setStatus(TaskStatusEnum.COMPLETED.getValue());
                 finalTask.setCompletedAt(LocalDateTime.now());
+                // 5.异步上传代码快照和报告到 MinIO
+                uploadToMinioAsync(finalTask, request);
             } catch (Exception e) {
                 log.error("审查任务执行失败: taskId={}", finalTask.getId(), e);
                 finalTask.setStatus(TaskStatusEnum.FAILED.getValue());
@@ -244,6 +254,38 @@ public class ReviewService {
         } else {
             // 3.如果是目录需要调用解析文件服务获取文件再审查每一个文件，并将findings放入Future
 
+            String path = request.getProjectPath();
+            if (path == null || path.trim().isEmpty()) {
+                path = request.getDirectoryPath();
+            }
+
+            if (path == null || path.trim().isEmpty()) {
+                throw new IllegalArgumentException("项目或目录路径不能为空");
+            }
+            // 3.1获取排除文件和包括文件
+            String includePaths = configService.getSettings().getIncludePaths();
+            String excludePaths = configService.getSettings().getExcludePaths();
+
+            // 3.2调用解析服务解析文件夹得到每一个文件路径
+            List<Path> files = codeParserService.scanDirectory(path, includePaths, excludePaths);
+            log.info("开始并行审查本地目录: taskId={}, path={}, 文件数={}", task.getId(), path, files.size());
+
+            Path pathFile = Paths.get(path).toAbsolutePath().normalize();
+            futures = files.stream()
+                    .map(filePath -> executor.submit(() -> {
+                        try {
+                            // 获取每一个文件的相对路径，侦察语言，避免路径太长
+                            String content = codeParserService.readFile(filePath.toString());
+                            Path relativizePath = pathFile.relativize(filePath.toAbsolutePath().normalize());
+                            return reviewSingleFile(relativizePath.toString(), content, request);
+                        } catch (Exception e) {
+                            log.error("读取文件失败: {}", filePath, e);
+                            return new ArrayList<Finding>();
+                        }
+                    }))
+                    .collect(Collectors.toList());
+
+
         }
         // 4.Future对象调用get方法判断是否完成，由主线程完成
         List<Finding> allFindings = new ArrayList<>();
@@ -258,6 +300,8 @@ public class ReviewService {
             }
         }
         // 5.保存到数据库
+        saveFindings(task, allFindings);
+        log.info("并行审查完成: taskId={}, findingsCount={}", task.getId(), allFindings.size());
     }
     private void saveFindings(ReviewTask task, List<Finding> findings) {
         // 由于保存过了，所以这次需要确认第一次保存时候的taskId
@@ -301,11 +345,27 @@ public class ReviewService {
         List<Finding> findings = Collections.emptyList();
         // 1.使用规则引擎
         if  (userRulesOnly) {
+            // 1.1如果是传统的规则
+            if ("CUSTOM".equalsIgnoreCase(request.getRuleTemplate())) {
+                findings = ruleEngineService.reviewWithCustom(codeContent, request.getCustomRules());
 
-        }
-        // 2.调用AI模型进行审查
-        else {
+            } else {
+                // 1.2如果是自定义的规则
+                findings = ruleEngineService.reviewWithTemplate(codeContent, language, request.getRuleTemplate());
 
+            }
+            // 规则引擎模式下手动标记来源
+            if (findings != null) {
+                findings.forEach(f -> f.setSource("RuleEngine"));
+            }
+        } else {
+            // 2.调用AI模型进行审查
+            findings = aiModelService.reviewCode(
+                    codeContent,
+                    language,
+                    request.getModelProvider(),
+                    request.getEnableRag() != null ? request.getEnableRag() : true
+            );
         }
 
         if (findings == null) {
@@ -571,6 +631,85 @@ public class ReviewService {
         }
 
     }
+
+    /**
+     * 异步上传代码快照和报告到 MinIO
+     * @param task 审查任务
+     * @param request 审查请求
+     */
+    private void uploadToMinioAsync(ReviewTask task, ReviewRequestDTO request) {
+        uploadExecutor.submit(() -> {
+            try {
+                // 1. 上传代码快照
+                String codeSnapshot = fetchCodeContent(request);
+                if (codeSnapshot != null && !codeSnapshot.trim().isEmpty()) {
+                    String codeSnapshotFile = minioStorageService.uploadStringContent(
+                            codeSnapshot, ".txt", "code-snapshots/" + task.getId()
+                    );
+                    log.info("Code snapshot uploaded to MinIO: taskId={}, file={}", task.getId(), codeSnapshotFile);
+
+                    // 2. 更新报告实体中的代码快照文件引用
+                    updateReportWithCodeSnapshot(task.getId(), codeSnapshotFile);
+                }
+
+                // 3. 使用 ReportService 生成报告（会同时生成 HTML 和 Markdown）
+                ReviewReport report = reportService.generateReport(task.getId());
+
+                // 4. 上传 HTML 报告到 MinIO
+                if (report.getHtmlContent() != null && !report.getHtmlContent().isEmpty()) {
+                    String htmlFile = minioStorageService.uploadStringContent(
+                            report.getHtmlContent(), ".html", "reports/" + task.getId()
+                    );
+                    log.info("HTML report uploaded to MinIO: taskId={}, file={}", task.getId(), htmlFile);
+
+                    // 5. 上传 Markdown 报告到 MinIO
+                    if (report.getMarkdownContent() != null && !report.getMarkdownContent().isEmpty()) {
+                        String markdownFile = minioStorageService.uploadStringContent(
+                                report.getMarkdownContent(), ".md", "reports/" + task.getId()
+                        );
+                        log.info("Markdown report uploaded to MinIO: taskId={}, file={}", task.getId(), markdownFile);
+
+                        // 6. 更新报告实体中的 MinIO 文件引用
+                        updateReportWithMinioFiles(task.getId(), htmlFile, markdownFile);
+                    }
+                }
+            } catch (Exception e) {
+                log.error("Failed to upload to MinIO: taskId={}", task.getId(), e);
+                // 不影响主流程，仅记录错误
+            }
+        });
+    }
+
+    /**
+     * 更新报告实体中的代码快照文件引用
+     */
+    private void updateReportWithCodeSnapshot(Long taskId, String codeSnapshotFile) {
+        reportRepository.findByTaskId(taskId).ifPresent(report -> {
+            report.setCodeSnapshotFile(codeSnapshotFile);
+            reportRepository.save(report);
+        });
+    }
+
+    /**
+     * 更新报告实体中的 MinIO 文件引用
+     */
+    private void updateReportWithMinioFiles(Long taskId, String htmlFile, String markdownFile) {
+        reportRepository.findByTaskId(taskId).ifPresentOrElse(report -> {
+            report.setHtmlFile(htmlFile);
+            report.setMarkdownFile(markdownFile);
+            reportRepository.save(report);
+        }, () -> {
+            // 如果报告不存在，创建新报告
+            ReviewReport report = ReviewReport.builder()
+                    .taskId(taskId)
+                    .htmlFile(htmlFile)
+                    .markdownFile(markdownFile)
+                    .build();
+            reportRepository.save(report);
+            log.info("Created new report for taskId={} with MinIO files", taskId);
+        });
+    }
+
     private String determineScope(ReviewRequestDTO request) {
         String type = request.getReviewType() != null ? request.getReviewType().toUpperCase() : "UNKNOWN";
         switch (type) {

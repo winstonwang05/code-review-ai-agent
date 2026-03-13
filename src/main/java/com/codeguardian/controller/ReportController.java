@@ -1,7 +1,9 @@
 package com.codeguardian.controller;
 
 import com.codeguardian.entity.ReviewReport;
+import com.codeguardian.repository.ReviewReportRepository;
 import com.codeguardian.service.ReportService;
+import com.codeguardian.service.rag.MinioStorageService;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.http.HttpHeaders;
@@ -9,6 +11,10 @@ import org.springframework.http.HttpStatus;
 import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.*;
+import org.springframework.web.server.ResponseStatusException;
+import java.io.ByteArrayOutputStream;
+import java.io.InputStream;
+import java.nio.charset.StandardCharsets;
 import java.time.LocalDateTime;
 import java.time.format.DateTimeFormatter;
 
@@ -20,8 +26,10 @@ import java.time.format.DateTimeFormatter;
 @RequiredArgsConstructor
 @Slf4j
 public class ReportController {
-    
+
     private final ReportService reportService;
+    private final ReviewReportRepository reportRepository;
+    private final MinioStorageService minioStorageService;
     
     /**
      * 生成审查报告
@@ -640,5 +648,168 @@ public class ReportController {
         html = sb.toString();
         
         return html;
+    }
+
+    /**
+     * 从 MinIO 下载 HTML 报告
+     */
+    @GetMapping("/{taskId}/html/minio")
+    public ResponseEntity<byte[]> getHtmlFromMinio(@PathVariable("taskId") Long taskId) {
+        try {
+            ReviewReport report = reportRepository.findByTaskId(taskId)
+                    .orElseThrow(() -> new ResponseStatusException(HttpStatus.NOT_FOUND, "报告不存在"));
+
+            if (report.getHtmlFile() == null || report.getHtmlFile().isEmpty()) {
+                // 如果 MinIO 文件不存在，尝试返回数据库中的内容
+                if (report.getHtmlContent() != null && !report.getHtmlContent().isEmpty()) {
+                    return ResponseEntity.ok()
+                            .header(HttpHeaders.CONTENT_TYPE, MediaType.TEXT_HTML_VALUE)
+                            .body(report.getHtmlContent().getBytes(StandardCharsets.UTF_8));
+                }
+                throw new ResponseStatusException(HttpStatus.NOT_FOUND, "HTML 报告文件不存在");
+            }
+
+            // 从 MinIO 下载文件
+            try (InputStream inputStream = minioStorageService.getFile(report.getHtmlFile());
+                 ByteArrayOutputStream outputStream = new ByteArrayOutputStream()) {
+                byte[] buffer = new byte[8192];
+                int bytesRead;
+                while ((bytesRead = inputStream.read(buffer)) != -1) {
+                    outputStream.write(buffer, 0, bytesRead);
+                }
+
+                HttpHeaders headers = new HttpHeaders();
+                headers.setContentType(MediaType.TEXT_HTML);
+                headers.setContentDispositionFormData("attachment", "report_" + taskId + ".html");
+
+                return ResponseEntity.ok()
+                        .headers(headers)
+                        .body(outputStream.toByteArray());
+            }
+        } catch (ResponseStatusException e) {
+            throw e;
+        } catch (Exception e) {
+            log.error("从 MinIO 下载 HTML 报告失败: taskId={}", taskId, e);
+            throw new ResponseStatusException(HttpStatus.INTERNAL_SERVER_ERROR, "下载报告失败: " + e.getMessage());
+        }
+    }
+
+    /**
+     * 从 MinIO 下载 Markdown 报告
+     */
+    @GetMapping("/{taskId}/markdown/minio")
+    public ResponseEntity<byte[]> getMarkdownFromMinio(@PathVariable("taskId") Long taskId) {
+        try {
+            ReviewReport report = reportRepository.findByTaskId(taskId)
+                    .orElseThrow(() -> new ResponseStatusException(HttpStatus.NOT_FOUND, "报告不存在"));
+
+            if (report.getMarkdownFile() == null || report.getMarkdownFile().isEmpty()) {
+                // 如果 MinIO 文件不存在，尝试返回数据库中的内容
+                if (report.getMarkdownContent() != null && !report.getMarkdownContent().isEmpty()) {
+                    return ResponseEntity.ok()
+                            .header(HttpHeaders.CONTENT_TYPE, MediaType.TEXT_PLAIN_VALUE)
+                            .body(report.getMarkdownContent().getBytes(StandardCharsets.UTF_8));
+                }
+                throw new ResponseStatusException(HttpStatus.NOT_FOUND, "Markdown 报告文件不存在");
+            }
+
+            // 从 MinIO 下载文件
+            try (InputStream inputStream = minioStorageService.getFile(report.getMarkdownFile());
+                 ByteArrayOutputStream outputStream = new ByteArrayOutputStream()) {
+                byte[] buffer = new byte[8192];
+                int bytesRead;
+                while ((bytesRead = inputStream.read(buffer)) != -1) {
+                    outputStream.write(buffer, 0, bytesRead);
+                }
+
+                HttpHeaders headers = new HttpHeaders();
+                headers.setContentType(MediaType.TEXT_PLAIN);
+                headers.setContentDispositionFormData("attachment", "report_" + taskId + ".md");
+
+                return ResponseEntity.ok()
+                        .headers(headers)
+                        .body(outputStream.toByteArray());
+            }
+        } catch (ResponseStatusException e) {
+            throw e;
+        } catch (Exception e) {
+            log.error("从 MinIO 下载 Markdown 报告失败: taskId={}", taskId, e);
+            throw new ResponseStatusException(HttpStatus.INTERNAL_SERVER_ERROR, "下载报告失败: " + e.getMessage());
+        }
+    }
+
+    /**
+     * 从 MinIO 下载代码快照
+     */
+    @GetMapping("/{taskId}/code-snapshot/minio")
+    public ResponseEntity<byte[]> getCodeSnapshotFromMinio(@PathVariable("taskId") Long taskId) {
+        try {
+            ReviewReport report = reportRepository.findByTaskId(taskId)
+                    .orElseThrow(() -> new ResponseStatusException(HttpStatus.NOT_FOUND, "报告不存在"));
+
+            if (report.getCodeSnapshotFile() == null || report.getCodeSnapshotFile().isEmpty()) {
+                throw new ResponseStatusException(HttpStatus.NOT_FOUND, "代码快照文件不存在");
+            }
+
+            // 从 MinIO 下载文件
+            try (InputStream inputStream = minioStorageService.getFile(report.getCodeSnapshotFile());
+                 ByteArrayOutputStream outputStream = new ByteArrayOutputStream()) {
+                byte[] buffer = new byte[8192];
+                int bytesRead;
+                while ((bytesRead = inputStream.read(buffer)) != -1) {
+                    outputStream.write(buffer, 0, bytesRead);
+                }
+
+                HttpHeaders headers = new HttpHeaders();
+                headers.setContentType(MediaType.TEXT_PLAIN);
+                headers.setContentDispositionFormData("attachment", "code_snapshot_" + taskId + ".txt");
+
+                return ResponseEntity.ok()
+                        .headers(headers)
+                        .body(outputStream.toByteArray());
+            }
+        } catch (ResponseStatusException e) {
+            throw e;
+        } catch (Exception e) {
+            log.error("从 MinIO 下载代码快照失败: taskId={}", taskId, e);
+            throw new ResponseStatusException(HttpStatus.INTERNAL_SERVER_ERROR, "下载代码快照失败: " + e.getMessage());
+        }
+    }
+
+    /**
+     * 获取 MinIO 预签名下载 URL
+     * @param taskId 任务 ID
+     * @param fileType 文件类型 (html, markdown, code-snapshot)
+     * @param expirySeconds 过期时间（秒，默认 3600）
+     * @return 预签名 URL
+     */
+    @GetMapping("/{taskId}/presigned-url")
+    public ResponseEntity<String> getPresignedUrl(
+            @PathVariable("taskId") Long taskId,
+            @RequestParam("fileType") String fileType,
+            @RequestParam(value = "expiry", defaultValue = "3600") int expirySeconds) {
+        try {
+            ReviewReport report = reportRepository.findByTaskId(taskId)
+                    .orElseThrow(() -> new ResponseStatusException(HttpStatus.NOT_FOUND, "报告不存在"));
+
+            String objectName = switch (fileType.toLowerCase()) {
+                case "html" -> report.getHtmlFile();
+                case "markdown", "md" -> report.getMarkdownFile();
+                case "code-snapshot", "snapshot", "code" -> report.getCodeSnapshotFile();
+                default -> throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "不支持的文件类型: " + fileType);
+            };
+
+            if (objectName == null || objectName.isEmpty()) {
+                throw new ResponseStatusException(HttpStatus.NOT_FOUND, "文件不存在: " + fileType);
+            }
+
+            String presignedUrl = minioStorageService.getPresignedDownloadUrl(objectName, expirySeconds);
+            return ResponseEntity.ok(presignedUrl);
+        } catch (ResponseStatusException e) {
+            throw e;
+        } catch (Exception e) {
+            log.error("获取预签名 URL 失败: taskId={}, fileType={}", taskId, fileType, e);
+            throw new ResponseStatusException(HttpStatus.INTERNAL_SERVER_ERROR, "获取预签名 URL 失败: " + e.getMessage());
+        }
     }
 }

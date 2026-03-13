@@ -37,6 +37,18 @@ public class AIModelService {
     private final AIConfigProperties aiConfigProperties;
     private final ToolRegistry toolRegistry;
 
+    /**
+     * 审查代码
+     *
+     * @param codeContent 代码内容
+     * @param language 代码语言
+     * @param modelProvider 模型提供商（可选，如果为null则使用配置的provider）
+     * @param enableRag 是否启用RAG知识库增强
+     * @return 审查发现的问题列表
+     */
+    public List<Finding> reviewCode(String codeContent, String language, String modelProvider, boolean enableRag) {
+        return reviewCode(codeContent, language, modelProvider, enableRag, null);
+    }
 
 
     /**

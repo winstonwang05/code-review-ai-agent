@@ -46,6 +46,24 @@ public class ReviewReport {
      */
     @Column(columnDefinition = "TEXT")
     private String statistics;
+
+    /**
+     * MinIO 存储的 HTML 报告文件对象名
+     */
+    @Column(length = 500)
+    private String htmlFile;
+
+    /**
+     * MinIO 存储的 Markdown 报告文件对象名
+     */
+    @Column(length = 500)
+    private String markdownFile;
+
+    /**
+     * MinIO 存储的代码快照文件对象名
+     */
+    @Column(length = 500)
+    private String codeSnapshotFile;
     
     /**
      * 创建时间
