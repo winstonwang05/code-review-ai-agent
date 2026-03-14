@@ -52,18 +52,24 @@ public class KnowledgeBaseService {
     // 原始文档列表（用于BM25的构建）属于本地内存中，最开始需要从数据库获取
     private List<KnowledgeDocument> documents = new ArrayList<>();
     /**
-     * BM25索引结构
+     * BM25索引结构 - Chunk级别
      */
-    // 倒排索引构建
+    // 倒排索引构建 (现在存储chunk索引)
     private Map<String, List<Integer>> invertedIndex =  new HashMap<>();
-    // 词频和长度惩罚
-    private List<Map<String, Integer>> docTermFreqs = new ArrayList<>();
-    private List<Integer> docLengths = new ArrayList<>();
-    private double avgDocLength = 0;
+    // 词频和长度惩罚 (现在存储chunk级别)
+    private List<Map<String, Integer>> chunkTermFreqs = new ArrayList<>();
+    private List<Integer> chunkLengths = new ArrayList<>();
+    private double avgChunkLength = 0;
+    // 存储Chunk到文档的映射
+    private List<String> chunkToDocIds = new ArrayList<>();
+    // 缓存所有的chunks，用于统一管理
+    private List<String> allChunks = new ArrayList<>();
+    // 文档ID到chunks的映射
+    private Map<String, List<Integer>> docToChunks = new HashMap<>();
 
     // BM25 算法参数
-    private static final double k1 = 1.5;
-    private static final double b = 0.75;
+    private static final double K1 = 1.5;
+    private static final double B = 0.75;
 
     @PostConstruct
     public void init() {
@@ -223,6 +229,7 @@ public class KnowledgeBaseService {
         } else {
             log.info("Document split into {} chunks for vectorization.", chunks.size());
         }
+
         // 设置每一块的唯一标识,文章id
         for (Document chunk : chunks) {
             chunk.getMetadata().put("source_doc_id", doc.getId());
@@ -238,61 +245,70 @@ public class KnowledgeBaseService {
             // Consider rethrowing or handling (e.g. marking doc as failed in DB)
         }
 
+        // 4.更新BM25索引
+        log.info("Updating BM25 index for new document...");
+        buildIndices();
+        log.info("BM25 index updated.");
     }
 
     /**
-     * 构建 BM25 倒排索引和统计信息 (全量)
+     * 构建 BM25 倒排索引和统计信息 (全量) - Chunk级别
      */
     private void buildIndices() {
         // 1.先清空本地再重新构建
         if (documents.isEmpty()) return;
 
         invertedIndex.clear();
-        docTermFreqs.clear();
-        docLengths.clear();
+        chunkTermFreqs.clear();
+        chunkLengths.clear();
+        chunkToDocIds.clear();
+        allChunks.clear();
+        docToChunks.clear();
         long totalLength = 0;
 
-        // 2.遍历本地文章构建
-        for (int i = 0; i < documents.size(); i++) {
-            addToBM25Index(documents.get(i), i);
-            totalLength += docLengths.get(i);
+        // 2.遍历本地文章，使用统一的TokenTextSplitter切分
+        for (KnowledgeDocument doc : documents) {
+            String content = doc.getTitle() + "\n" + doc.getContent();
+            TokenTextSplitter splitter = new TokenTextSplitter();
+            List<Document> chunks = splitter.apply(
+                List.of(new Document(doc.getId(), content, doc.getMetadata() != null ? new HashMap<>(doc.getMetadata()) : new HashMap<>()))
+            );
+
+            // 记录文档到chunks的映射
+            docToChunks.put(doc.getId(), new ArrayList<>());
+
+            // 3.为每个chunk构建BM25索引
+            for (int i = 0; i < chunks.size(); i++) {
+                Document chunk = chunks.get(i);
+                allChunks.add(chunk.getContent());
+                chunkToDocIds.add(doc.getId());
+                docToChunks.get(doc.getId()).add(allChunks.size() - 1);
+
+                // 构建BM25索引
+                String text = chunk.getContent().toLowerCase();
+                Map<String, Integer> freqs = new HashMap<>();
+                List<String> terms = tokenize(text);
+
+                for (String term : terms) {
+                    freqs.put(term, freqs.getOrDefault(term, 0) + 1);
+                }
+                chunkTermFreqs.add(freqs);
+                chunkLengths.add(terms.size());
+
+                // 构建倒排索引
+                for (String term : freqs.keySet()) {
+                    invertedIndex.computeIfAbsent(term, k -> new ArrayList<>()).add(allChunks.size() - 1);
+                }
+
+                totalLength += terms.size();
+            }
         }
 
-        avgDocLength = (double) totalLength / documents.size();
-        log.info("Built BM25 Index for {} documents", documents.size());
+        avgChunkLength = (double) totalLength / chunkLengths.size();
+        log.info("Built BM25 Index for {} chunks across {} documents", chunkLengths.size(), documents.size());
     }
 
-    /**
-     * 构建BM25，包括倒排索引，逆文档词频，词频，长度；这里只是针对一篇文章的构建
-     * @param doc 知识库文章
-     * @param index 文章索引, 倒排索引使用
-     */
-    private void addToBM25Index(KnowledgeDocument doc, int index) {
-        // 1.拼接标题和内容并分块
-        String text = (doc.getTitle() + " " + doc.getContent()).toLowerCase();
-        Map<String, Integer> freqs = new HashMap<>();
-        List<String> terms = tokenize(text);
-
-        // 2.遍历分块构建词频
-        for (String term : terms) {
-            freqs.put(term, freqs.getOrDefault(term, 0) + 1);
-        }
-        // 添加到本地构建
-        docTermFreqs.add(freqs);
-        docLengths.add(terms.size());
-
-        // 3.构建倒排索引
-        for (String term : freqs.keySet()) {
-            invertedIndex.computeIfAbsent(term, k -> new ArrayList<>()).add(index);
-        }
-        // 4.更新平均长度
-        // 这里需要获取本地文档长度 - 1；因为此时的此时的文档长度加上了现在即将更新文章的索引
-        if (avgDocLength > 0) {
-            long totalLength = (long) avgDocLength * (documents.size() - 1) + terms.size();
-            avgDocLength = (double) totalLength / documents.size();
-        }
-    }
-
+  
     /**
      * 上传并处理文档 (支持多种格式)
      */
@@ -341,9 +357,9 @@ public class KnowledgeBaseService {
             // 3.构建实体类，并保存到DB和Vector Store
             saveDocument(doc);
             log.info("Document saved successfully. ID: {}", id);
-            // 4.并更新BM25索引
-            log.info("Updating BM25 index...");
-            addToBM25Index(doc, this.documents.size() - 1);
+            // 4.重新构建BM25索引（支持chunk级别）
+            log.info("Rebuilding BM25 index with chunk support...");
+            buildIndices();
             log.info("BM25 index updated.");
         } catch (Exception e) {
             log.error("Error during document upload process", e);
@@ -373,10 +389,7 @@ public class KnowledgeBaseService {
         return minioStorageService.getFile(objectName);
     }
 
-    public List<KnowledgeDocument> getAllDocuments() {
-        return this.documents;
-    }
-
+  
 
     public Map<String, Object> getStats() {
         long count = repository.count();
@@ -429,10 +442,28 @@ public class KnowledgeBaseService {
     }
 
     /**
-     * 使用BM25检索
+     * 获取指定文档的所有chunks
+     */
+    public List<String> getDocumentChunks(String docId) {
+        if (!docToChunks.containsKey(docId)) {
+            return Collections.emptyList();
+        }
+
+        List<Integer> chunkIndices = docToChunks.get(docId);
+        List<String> chunks = new ArrayList<>();
+        for (int idx : chunkIndices) {
+            if (idx < allChunks.size()) {
+                chunks.add(allChunks.get(idx));
+            }
+        }
+        return chunks;
+    }
+
+    /**
+     * 使用BM25检索 - Chunk级别
      * @param query 用户的问题
      * @param topK 前K个得分
-     * @return 返回前K个文章id
+     * @return 返回前K个chunk索引
      */
     private List<Integer> searchBM25(String query, int topK) {
         // 1.先将用户的问题拆分分块并遍历
@@ -440,39 +471,34 @@ public class KnowledgeBaseService {
 
         Map<Integer, Double> scores = new HashMap<>();
         for (String term : queryTerms) {
-            // 2.使用倒排索引，确定在哪些篇章
-            List<Integer> docIndices = invertedIndex.get(term);
-            if (docIndices == null) {
+            // 2.使用倒排索引，确定在哪些chunks
+            List<Integer> chunkIndices = invertedIndex.get(term);
+            if (chunkIndices == null) {
                 continue;
             }
-            // 3.计算逆文档频率，也就是稀有程度，出现的越少，越稀有，权重越高
-            double idf = Math.log(1 + (documents.size() - docIndices.size() + 0.5) / (docIndices.size() + 0.5));
+            // 3.计算逆文档频率，现在基于chunk数量
+            double idf = Math.log(1 + (chunkTermFreqs.size() - chunkIndices.size() + 0.5) / (chunkIndices.size() + 0.5));
 
-
-            // 针对一篇文章下的
-            for  (Integer docIdx : docIndices) {
-                // 4.计算词频，以及长度惩罚，如果在某一篇文章出现得多，文章越短，权重越高
+            // 针对每个chunk计算得分
+            for (Integer chunkIdx : chunkIndices) {
                 // 防御性编程
-                if (docIdx >= docTermFreqs.size()) continue;
-                int freq = docTermFreqs.get(docIdx).getOrDefault(term, 0);
-                int docLen = docLengths.get(docIdx);
-                double numerator = freq * (k1 + 1);
-                double denominator = freq + k1 * (1 - b + b * (docLen / avgDocLength));
+                if (chunkIdx >= chunkTermFreqs.size()) {
+                    continue;
+                }
+                int freq = chunkTermFreqs.get(chunkIdx).getOrDefault(term, 0);
+                int chunkLen = chunkLengths.get(chunkIdx);
+                double numerator = freq * (K1 + 1);
+                double denominator = freq + K1 * (1 - B + B * (chunkLen / avgChunkLength));
 
-                scores.put(docIdx, scores.getOrDefault(docIdx, 0.0) + idf * numerator / denominator);
-
-
-
+                scores.put(chunkIdx, scores.getOrDefault(chunkIdx, 0.0) + idf * numerator / denominator);
             }
-
         }
-        // 5.排序得分并获取前k个文章id
+        // 5.排序得分并获取前k个chunk索引
         return scores.entrySet().stream()
                 .sorted(Map.Entry.<Integer, Double>comparingByValue().reversed())
                 .limit(topK)
                 .map(Map.Entry::getKey)
                 .collect(Collectors.toList());
-
     }
 
     private String sanitizeRagText(String text) {
@@ -506,7 +532,10 @@ public class KnowledgeBaseService {
     /**
      * RRF算法重排序，将向量库的排行和BM25排行重新排序
      */
-    private List<KnowledgeDocument> mergeAndRerank(List<Document> vectorDocs, List<Integer> bm25Indices, int topK) {
+    /**
+     * RRF算法重排序，将向量库的排行和BM25排行重新排序 - 用于返回KnowledgeDocument
+     */
+    private List<KnowledgeDocument> mergeAndRerank(List<Document> vectorDocs, List<Integer> bm25ChunkIndices, int topK) {
         Map<String, Double> rrfScores = new HashMap<>();
         int k = 60;
 
@@ -520,9 +549,10 @@ public class KnowledgeBaseService {
             }
         }
         // 遍历BM25检索排名前面的计算得分并映射到对应文章id
-        for (int i = 0; i < bm25Indices.size(); i++) {
-            if (bm25Indices.get(i) < documents.size()) {
-                String id = documents.get(bm25Indices.get(i)).getId();
+        for (int i = 0; i < bm25ChunkIndices.size(); i++) {
+            int chunkIdx = bm25ChunkIndices.get(i);
+            if (chunkIdx < chunkToDocIds.size()) {
+                String id = chunkToDocIds.get(chunkIdx);
                 rrfScores.put(id, rrfScores.getOrDefault(id, 0.0) + 1.0 / (k + i + 1));
             }
         }
@@ -534,79 +564,90 @@ public class KnowledgeBaseService {
                 .filter(Objects::nonNull)
                 .collect(Collectors.toList());
     }
-    private KnowledgeDocument findDocById(String id) {
+
+    /**
+     * RRF算法重排序，直接返回chunks列表
+     */
+    private List<String> mergeAndRerankSnippets(List<Document> vectorDocs, List<Integer> bm25ChunkIndices, int topK) {
+        // 收集所有chunks及其RRF分数
+        Map<String, Double> chunkScores = new HashMap<>();
+        int k = 60;
+
+        // 1.处理向量检索结果
+        if (vectorDocs != null) {
+            for (int i = 0; i < vectorDocs.size(); i++) {
+                Document doc = vectorDocs.get(i);
+                String chunkContent = sanitizeRagText(doc.getContent());
+                if (!chunkContent.trim().isEmpty()) {
+                    chunkScores.put(chunkContent,
+                            chunkScores.getOrDefault(chunkContent, 0.0) + 1.0 / (k + i + 1));
+                }
+            }
+        }
+
+        // 2.处理BM25检索结果，增加已有chunk的分数
+        for (int i = 0; i < bm25ChunkIndices.size(); i++) {
+            int chunkIdx = bm25ChunkIndices.get(i);
+            if (chunkIdx < allChunks.size()) {
+                String chunkContent = sanitizeRagText(allChunks.get(chunkIdx));
+                if (!chunkContent.trim().isEmpty()) {
+                    chunkScores.put(chunkContent,
+                            chunkScores.getOrDefault(chunkContent, 0.0) + 1.0 / (k + i + 1));
+                }
+            }
+        }
+
+        // 3.按RRF分数排序并返回topK个chunks
+        return chunkScores.entrySet().stream()
+                .sorted(Map.Entry.<String, Double>comparingByValue().reversed())
+                .limit(topK)
+                .map(Map.Entry::getKey)
+                .collect(Collectors.toList());
+    }
+
+      private KnowledgeDocument findDocById(String id) {
         return documents.stream().filter(d -> d.getId().equals(id)).findFirst().orElse(null);
     }
 
     /**
-     * 搜索相关片段（返回切片后的文本，而不是完整文档）
+     * 搜索相关片段
      * 用于 RAG 上下文构建，避免 Token 超限
      */
     public List<String> searchSnippets(String query, int topK) {
-        // 1. 优先使用向量检索获取精确片段
-        try {
-            List<Document> vectorResults = vectorStore.similaritySearch(
-                    SearchRequest.query(query).withTopK(topK)
-            );
-
-            if (!vectorResults.isEmpty()) {
-                log.info("Found {} snippets via Vector Search", vectorResults.size());
-                return vectorResults.stream()
-                        .map(doc -> {
-                            String title = (String) doc.getMetadata().getOrDefault("title", "");
-                            String content = sanitizeRagText(doc.getContent());
-                            String formatted = title.isEmpty() ? content : "【" + title + "】\n" + content;
-                            return formatted;
-                        })
-                        .filter(s -> s != null && !s.trim().isEmpty())
-                        .collect(Collectors.toList());
-            }
-        } catch (Exception e) {
-            log.warn("Vector search failed: {}", e.getMessage());
-        }
-
-        // 2. 如果向量检索无果，回退到混合检索（但截断内容）
-        log.info("Vector search empty/failed, falling back to document search");
-        List<KnowledgeDocument> docs = search(query, topK);
-        return docs.stream()
-                .map(doc -> {
-                    String content = doc.getContent();
-                    String title = doc.getTitle();
-                    String combined = sanitizeRagText("【" + title + "】\n" + content);
-                    if (combined.length() > 800) {
-                        return combined.substring(0, 800) + "... (truncated)";
-                    }
-                    return combined;
-                })
-                .filter(s -> s != null && !s.trim().isEmpty())
-                .collect(Collectors.toList());
-    }
-
-    /**
-     * 执行混合检索 (Hybrid Search)
-     */
-    public List<KnowledgeDocument> search(String query, int topK) {
-        if (documents.isEmpty()) return Collections.emptyList();
-
-        // 1. 向量检索
+        // 1.向量检索，如果向量检索无果，则BM25兜底
         List<Document> vectorResults = Collections.emptyList();
         try {
             vectorResults = vectorStore.similaritySearch(
-                    SearchRequest.query(query).withTopK(topK)
+                    SearchRequest.query(query)
+                            .withTopK(topK)
+                            .withSimilarityThreshold(0.75)
             );
+            log.info("Vector search found {} chunks passing the threshold.", vectorResults.size());
         } catch (Exception e) {
-            log.debug("Vector search failed (using BM25 only): {}", e.getMessage());
+            log.warn("【降级】向量检索异常或超时，不中断流程: {}", e.getMessage());
         }
 
-        // 2. BM25 检索
-        List<Integer> bm25Indices = searchBM25(query, topK);
+        // 2.BM 25精准匹配，如果还是没有结果，使用BM25兜底
+        List<Integer> bm25ChunkIndices = Collections.emptyList();
+        try {
+            if (!allChunks.isEmpty()) {
+                bm25ChunkIndices = searchBM25(query, topK);
+                log.info("BM25 search found {} chunks.", bm25ChunkIndices.size());
+            }
+        } catch (Exception e) {
+            log.warn("【降级】BM25 检索异常，不中断流程: {}", e.getMessage());
+        }
 
-        // 3. 结果融合与重排序
-        return mergeAndRerank(vectorResults, bm25Indices, topK);
+        // 3.双路召回失败，返回空列表
+        if (bm25ChunkIndices.isEmpty() && vectorResults.isEmpty()) {
+            return Collections.emptyList();
+        }
+
+        // 4.使用RRF融合结果，直接返回chunks
+        return mergeAndRerankSnippets(vectorResults, bm25ChunkIndices, topK);
     }
 
-
-    /**
+      /**
      * 简单分词 (按空格和标点)
      * 支持中文分词需要引入更复杂的库 (如 Jieba, HanLP)，这里使用正则简单处理
      */
