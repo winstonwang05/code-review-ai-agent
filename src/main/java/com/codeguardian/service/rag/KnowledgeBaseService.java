@@ -3,6 +3,7 @@ package com.codeguardian.service.rag;
 import com.codeguardian.repository.KnowledgeDocumentRepository;
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.hankcs.hanlp.HanLP;
 import jakarta.annotation.PostConstruct;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
@@ -22,9 +23,12 @@ import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.stereotype.Service;
 import org.springframework.web.multipart.MultipartFile;
 
+import com.codeguardian.config.SearchConfig;
+import com.codeguardian.util.DocumentProcessor;
 import java.io.IOException;
 import java.io.InputStream;
 import java.util.*;
+import java.util.concurrent.locks.ReentrantReadWriteLock;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 import java.util.stream.Collectors;
@@ -49,28 +53,30 @@ public class KnowledgeBaseService {
     private final MinioStorageService minioStorageService;
     private final JdbcTemplate jdbcTemplate;
 
+    // 读写锁，用于保护索引的并发访问
+    private final ReentrantReadWriteLock rwLock = new ReentrantReadWriteLock();
+    private final ReentrantReadWriteLock.ReadLock readLock = rwLock.readLock();
+    private final ReentrantReadWriteLock.WriteLock writeLock = rwLock.writeLock();
+
     // 原始文档列表（用于BM25的构建）属于本地内存中，最开始需要从数据库获取
     private List<KnowledgeDocument> documents = new ArrayList<>();
     /**
-     * BM25索引结构 - Chunk级别
+     * BM25索引结构 - Chunk级别（使用UUID作为Key）
      */
-    // 倒排索引构建 (现在存储chunk索引)
-    private Map<String, List<Integer>> invertedIndex =  new HashMap<>();
-    // 词频和长度惩罚 (现在存储chunk级别)
-    private List<Map<String, Integer>> chunkTermFreqs = new ArrayList<>();
-    private List<Integer> chunkLengths = new ArrayList<>();
+    // 倒排索引构建（term -> list of chunk UUIDs）
+    private final Map<String, List<String>> invertedIndex = new HashMap<>();
+    // 词频和长度惩罚（chunk UUID -> stats）
+    private final Map<String, Map<String, Integer>> chunkTermFreqs = new HashMap<>();
+    private final Map<String, Integer> chunkLengths = new HashMap<>();
     private double avgChunkLength = 0;
-    // 存储Chunk到文档的映射
-    private List<String> chunkToDocIds = new ArrayList<>();
-    // 缓存所有的chunks，用于统一管理
-    private List<String> allChunks = new ArrayList<>();
-    // 文档ID到chunks的映射
-    private Map<String, List<Integer>> docToChunks = new HashMap<>();
-
-    // BM25 算法参数
-    private static final double K1 = 1.5;
-    private static final double B = 0.75;
-
+    // Chunk UUID -> 文档ID
+    private final Map<String, String> chunkToDocIds = new HashMap<>();
+    // 文档ID -> list of chunk UUIDs
+    private final Map<String, List<String>> docToChunks = new HashMap<>();
+    // 所有chunks的内容（UUID -> content）
+    private final Map<String, String> chunkContents = new HashMap<>();
+  
+    
     @PostConstruct
     public void init() {
         try {
@@ -212,9 +218,9 @@ public class KnowledgeBaseService {
      * 保存文档到 DB 和 VectorStore(向量库)
      */
     private void saveDocument(KnowledgeDocument doc) {
-        // 1.保存到数据库中,并更新本地文档
+        // 1.保存到数据库中
         repository.save(doc);
-        this.documents.add(doc);
+
 
         // 2.使用 TokenTextSplitter 切分
         // 默认参数: defaultChunkSize = 800, minChunkSizeChars = 350, minChunkLengthToEmbed = 5, maxNumChunks = 10000, keepSeparator = true
@@ -235,6 +241,10 @@ public class KnowledgeBaseService {
             chunk.getMetadata().put("source_doc_id", doc.getId());
         }
 
+        for (int i = 0; i < chunks.size(); i++) {
+            chunks.get(i).getMetadata().put("chunk_id", generateChunkId(doc.getId(), i));
+        }
+
         // 3.保存到向量库中
         try {
             log.info("Adding {} chunks to Vector Store...", chunks.size());
@@ -245,67 +255,88 @@ public class KnowledgeBaseService {
             // Consider rethrowing or handling (e.g. marking doc as failed in DB)
         }
 
-        // 4.更新BM25索引
+        // 4.更新BM25索引（使用写锁）并更新本地文档(需要写锁)
         log.info("Updating BM25 index for new document...");
-        buildIndices();
+        writeLock.lock();
+        try {
+            this.documents.add(doc);
+            // 注意：这里不需要 buildIndices() 再去获取锁了，因为我们当前线程已经拿到了写锁。
+            // ReentrantReadWriteLock 支持“可重入”（Reentrant），
+            // 也就是说，当前线程拿着写锁去调用同样需要写锁的 buildIndices() 是完全合法的，不会死锁。
+            buildIndices();
+
+        } finally {
+            writeLock.unlock();
+        }
         log.info("BM25 index updated.");
     }
 
     /**
-     * 构建 BM25 倒排索引和统计信息 (全量) - Chunk级别
+     * 构建 BM25 倒排索引和统计信息 (全量) - Chunk级别（使用写锁）
      */
     private void buildIndices() {
-        // 1.先清空本地再重新构建
-        if (documents.isEmpty()) return;
-
-        invertedIndex.clear();
-        chunkTermFreqs.clear();
-        chunkLengths.clear();
-        chunkToDocIds.clear();
-        allChunks.clear();
-        docToChunks.clear();
-        long totalLength = 0;
-
-        // 2.遍历本地文章，使用统一的TokenTextSplitter切分
-        for (KnowledgeDocument doc : documents) {
-            String content = doc.getTitle() + "\n" + doc.getContent();
-            TokenTextSplitter splitter = new TokenTextSplitter();
-            List<Document> chunks = splitter.apply(
-                List.of(new Document(doc.getId(), content, doc.getMetadata() != null ? new HashMap<>(doc.getMetadata()) : new HashMap<>()))
-            );
-
-            // 记录文档到chunks的映射
-            docToChunks.put(doc.getId(), new ArrayList<>());
-
-            // 3.为每个chunk构建BM25索引
-            for (int i = 0; i < chunks.size(); i++) {
-                Document chunk = chunks.get(i);
-                allChunks.add(chunk.getContent());
-                chunkToDocIds.add(doc.getId());
-                docToChunks.get(doc.getId()).add(allChunks.size() - 1);
-
-                // 构建BM25索引
-                String text = chunk.getContent().toLowerCase();
-                Map<String, Integer> freqs = new HashMap<>();
-                List<String> terms = tokenize(text);
-
-                for (String term : terms) {
-                    freqs.put(term, freqs.getOrDefault(term, 0) + 1);
-                }
-                chunkTermFreqs.add(freqs);
-                chunkLengths.add(terms.size());
-
-                // 构建倒排索引
-                for (String term : freqs.keySet()) {
-                    invertedIndex.computeIfAbsent(term, k -> new ArrayList<>()).add(allChunks.size() - 1);
-                }
-
-                totalLength += terms.size();
-            }
+        writeLock.lock();
+        try {
+            // 1.先清空本地再重新构建
+            if (documents.isEmpty()) {
+            return;
         }
 
-        avgChunkLength = (double) totalLength / chunkLengths.size();
-        log.info("Built BM25 Index for {} chunks across {} documents", chunkLengths.size(), documents.size());
+            invertedIndex.clear();
+            chunkTermFreqs.clear();
+            chunkLengths.clear();
+            chunkToDocIds.clear();
+            chunkContents.clear();
+            docToChunks.clear();
+              long totalLength = 0;
+
+            // 2.遍历本地文章，使用统一的TokenTextSplitter切分
+            for (KnowledgeDocument doc : documents) {
+                String content = doc.getTitle() + "\n" + doc.getContent();
+                TokenTextSplitter splitter = new TokenTextSplitter();
+                List<Document> chunks = splitter.apply(
+                    List.of(new Document(doc.getId(), content, doc.getMetadata() != null ? new HashMap<>(doc.getMetadata()) : new HashMap<>()))
+                );
+
+                // 记录文档到chunks的映射
+                docToChunks.put(doc.getId(), new ArrayList<>());
+
+                // 3.为每个chunk构建BM25索引
+                for (int i = 0; i < chunks.size(); i++) {
+                    Document chunk = chunks.get(i);
+                    String chunkContent = chunk.getContent();
+                    String chunkId = generateChunkId(doc.getId(), i);
+
+                    // 存储chunk内容
+                    chunkContents.put(chunkId, chunkContent);
+                    chunkToDocIds.put(chunkId, doc.getId());
+                    docToChunks.get(doc.getId()).add(chunkId);
+
+                    // 构建BM25索引
+                    String text = chunkContent.toLowerCase();
+                    Map<String, Integer> freqs = new HashMap<>();
+                    List<String> terms = tokenizeWithHanLP(text);
+
+                    for (String term : terms) {
+                        freqs.put(term, freqs.getOrDefault(term, 0) + 1);
+                    }
+                    chunkTermFreqs.put(chunkId, freqs);
+                    chunkLengths.put(chunkId, terms.size());
+
+                    // 构建倒排索引
+                    for (String term : freqs.keySet()) {
+                        invertedIndex.computeIfAbsent(term, k -> new ArrayList<>()).add(chunkId);
+                    }
+
+                    totalLength += terms.size();
+                }
+            }
+
+            avgChunkLength = (double) totalLength / chunkLengths.size();
+            log.info("Built BM25 Index for {} chunks across {} documents", chunkTermFreqs.size(), documents.size());
+        } finally {
+            writeLock.unlock();
+        }
     }
 
   
@@ -434,75 +465,96 @@ public class KnowledgeBaseService {
         } catch (Exception e) {
             log.error("Failed to delete chunks from Vector Store: {}", e.getMessage());
         }
-        // 4.删除本地缓存
-        this.documents.removeIf(d -> d.getId().equals(id));
-
-        // 5.重构本地BM25
-        buildIndices();
+        // 5. 更新本地缓存和重构 BM25 索引（原子操作，加写锁）
+        log.info("Updating local cache and rebuilding BM25 index after deletion...");
+        writeLock.lock();
+        try {
+            // 从本地文档列表中安全移除
+            this.documents.removeIf(d -> d.getId().equals(id));
+            // 重构索引
+            buildIndices();
+            log.info("Local cache and BM25 index rebuilt successfully.");
+        } finally {
+            writeLock.unlock();
+        }
     }
 
     /**
      * 获取指定文档的所有chunks
      */
     public List<String> getDocumentChunks(String docId) {
-        if (!docToChunks.containsKey(docId)) {
-            return Collections.emptyList();
-        }
-
-        List<Integer> chunkIndices = docToChunks.get(docId);
-        List<String> chunks = new ArrayList<>();
-        for (int idx : chunkIndices) {
-            if (idx < allChunks.size()) {
-                chunks.add(allChunks.get(idx));
+        readLock.lock();
+        try {
+            if (!docToChunks.containsKey(docId)) {
+                return Collections.emptyList();
             }
+
+            List<String> chunkIds = docToChunks.get(docId);
+            List<String> chunks = new ArrayList<>();
+            for (String chunkId : chunkIds) {
+                String content = chunkContents.get(chunkId);
+                if (content != null) {
+                    chunks.add(sanitizeRagText(content));
+                }
+            }
+            return chunks;
+        } finally {
+            readLock.unlock();
         }
-        return chunks;
     }
 
     /**
-     * 使用BM25检索 - Chunk级别
+     * 使用BM25检索 - Chunk级别（使用读锁）
      * @param query 用户的问题
      * @param topK 前K个得分
-     * @return 返回前K个chunk索引
+     * @return 返回前K个chunk ID
      */
-    private List<Integer> searchBM25(String query, int topK) {
-        // 1.先将用户的问题拆分分块并遍历
-        List<String> queryTerms = tokenize(query.toLowerCase());
+    private List<String> searchBM25(String query, int topK) {
+        readLock.lock();
+        try {
+            // 1.先将用户的问题拆分分块并遍历
+            List<String> queryTerms = tokenizeWithHanLP(query.toLowerCase());
 
-        Map<Integer, Double> scores = new HashMap<>();
-        for (String term : queryTerms) {
-            // 2.使用倒排索引，确定在哪些chunks
-            List<Integer> chunkIndices = invertedIndex.get(term);
-            if (chunkIndices == null) {
-                continue;
-            }
-            // 3.计算逆文档频率，现在基于chunk数量
-            double idf = Math.log(1 + (chunkTermFreqs.size() - chunkIndices.size() + 0.5) / (chunkIndices.size() + 0.5));
-
-            // 针对每个chunk计算得分
-            for (Integer chunkIdx : chunkIndices) {
-                // 防御性编程
-                if (chunkIdx >= chunkTermFreqs.size()) {
+            Map<String, Double> scores = new HashMap<>();
+            for (String term : queryTerms) {
+                // 2.使用倒排索引，确定在哪些chunks
+                List<String> chunkIds = invertedIndex.get(term);
+                if (chunkIds == null || chunkIds.isEmpty()) {
                     continue;
                 }
-                int freq = chunkTermFreqs.get(chunkIdx).getOrDefault(term, 0);
-                int chunkLen = chunkLengths.get(chunkIdx);
-                double numerator = freq * (K1 + 1);
-                double denominator = freq + K1 * (1 - B + B * (chunkLen / avgChunkLength));
+                // 3.计算逆文档频率，现在基于chunk数量
+                double idf = Math.log(1 + (chunkTermFreqs.size() - chunkIds.size() + 0.5) / (chunkIds.size() + 0.5));
 
-                scores.put(chunkIdx, scores.getOrDefault(chunkIdx, 0.0) + idf * numerator / denominator);
+                // 针对每个chunk计算得分
+                for (String chunkId : chunkIds) {
+                    // 防御性编程
+                    if (!chunkTermFreqs.containsKey(chunkId)) {
+                        log.warn("Chunk {} not found in chunkTermFreqs during BM25 search", chunkId);
+                        continue;
+                    }
+                    int freq = chunkTermFreqs.get(chunkId).getOrDefault(term, 0);
+                    int chunkLen = chunkLengths.get(chunkId);
+                    double numerator = freq * (SearchConfig.getBm25K1() + 1);
+                    double denominator = freq + SearchConfig.getBm25K1() * (1 - SearchConfig.getBm25B() + SearchConfig.getBm25B() * (chunkLen / avgChunkLength));
+
+                    scores.put(chunkId, scores.getOrDefault(chunkId, 0.0) + idf * numerator / denominator);
+                }
             }
+            // 4.排序得分并获取前k个chunk ID
+            return scores.entrySet().stream()
+                    .sorted(Map.Entry.<String, Double>comparingByValue().reversed())
+                    .limit(topK)
+                    .map(Map.Entry::getKey)
+                    .collect(Collectors.toList());
+        } finally {
+            readLock.unlock();
         }
-        // 5.排序得分并获取前k个chunk索引
-        return scores.entrySet().stream()
-                .sorted(Map.Entry.<Integer, Double>comparingByValue().reversed())
-                .limit(topK)
-                .map(Map.Entry::getKey)
-                .collect(Collectors.toList());
     }
 
     private String sanitizeRagText(String text) {
-        if (text == null) return "";
+        if (text == null) {
+            return "";
+        }
         String[] lines = text.split("\r?\n");
         StringBuilder sb = new StringBuilder();
         boolean prevBlank = false;
@@ -534,8 +586,9 @@ public class KnowledgeBaseService {
      */
     /**
      * RRF算法重排序，将向量库的排行和BM25排行重新排序 - 用于返回KnowledgeDocument
+     * 使用UUID作为Map Key进行精确打分
      */
-    private List<KnowledgeDocument> mergeAndRerank(List<Document> vectorDocs, List<Integer> bm25ChunkIndices, int topK) {
+    private List<KnowledgeDocument> mergeAndRerank(List<Document> vectorDocs, List<String> bm25ChunkIds, int topK) {
         Map<String, Double> rrfScores = new HashMap<>();
         int k = 60;
 
@@ -545,15 +598,16 @@ public class KnowledgeBaseService {
                 Document doc = vectorDocs.get(i);
                 // 尝试从 metadata 获取 source_doc_id，如果不存在则使用 docId
                 String id = (String) doc.getMetadata().getOrDefault("source_doc_id", doc.getId());
-                rrfScores.put(id, rrfScores.getOrDefault(id, 0.0) + 1.0 / (k + i + 1));
+                rrfScores.merge(id, 1.0 / (k + i + 1), Double::sum);
             }
         }
+
         // 遍历BM25检索排名前面的计算得分并映射到对应文章id
-        for (int i = 0; i < bm25ChunkIndices.size(); i++) {
-            int chunkIdx = bm25ChunkIndices.get(i);
-            if (chunkIdx < chunkToDocIds.size()) {
-                String id = chunkToDocIds.get(chunkIdx);
-                rrfScores.put(id, rrfScores.getOrDefault(id, 0.0) + 1.0 / (k + i + 1));
+        for (int i = 0; i < bm25ChunkIds.size(); i++) {
+            String chunkId = bm25ChunkIds.get(i);
+            String docId = chunkToDocIds.get(chunkId);
+            if (docId != null) {
+                rrfScores.merge(docId, 1.0 / (k + i + 1), Double::sum);
             }
         }
 
@@ -562,50 +616,126 @@ public class KnowledgeBaseService {
                 .limit(topK)
                 .map(e -> findDocById(e.getKey()))
                 .filter(Objects::nonNull)
-                .collect(Collectors.toList());
+                .toList();
     }
 
     /**
-     * RRF算法重排序，直接返回chunks列表
+     * RRF算法重排序，直接返回chunks列表（使用读锁）
      */
-    private List<String> mergeAndRerankSnippets(List<Document> vectorDocs, List<Integer> bm25ChunkIndices, int topK) {
-        // 收集所有chunks及其RRF分数
-        Map<String, Double> chunkScores = new HashMap<>();
-        int k = 60;
+    private List<String> mergeAndRerankSnippets(List<Document> vectorDocs, List<String> bm25ChunkIds, int topK) {
+        readLock.lock();
+        try {
+            // 收集所有chunks及其RRF分数
+            Map<String, Double> chunkScores = new HashMap<>();
+            int k = 60;
 
-        // 1.处理向量检索结果
-        if (vectorDocs != null) {
-            for (int i = 0; i < vectorDocs.size(); i++) {
-                Document doc = vectorDocs.get(i);
-                String chunkContent = sanitizeRagText(doc.getContent());
-                if (!chunkContent.trim().isEmpty()) {
-                    chunkScores.put(chunkContent,
-                            chunkScores.getOrDefault(chunkContent, 0.0) + 1.0 / (k + i + 1));
+            // 1.处理向量检索结果（需要转换为chunk ID）
+            if (vectorDocs != null) {
+                for (int i = 0; i < vectorDocs.size(); i++) {
+                    Document doc = vectorDocs.get(i);
+                    // 从向量结果中获取source_doc_id，然后找到对应的chunks
+                    String chunkId = (String) doc.getMetadata().get("chunk_id");
+                    if (chunkId != null) {
+                        String content = chunkContents.get(chunkId);
+                            if (content != null && !sanitizeRagText(content).trim().isEmpty()) {
+                                    chunkScores.put(chunkId,
+                                            chunkScores.getOrDefault(chunkId, 0.0) + 1.0 / (k + i + 1));
+                                }
+
+
+                    }
                 }
             }
-        }
 
-        // 2.处理BM25检索结果，增加已有chunk的分数
-        for (int i = 0; i < bm25ChunkIndices.size(); i++) {
-            int chunkIdx = bm25ChunkIndices.get(i);
-            if (chunkIdx < allChunks.size()) {
-                String chunkContent = sanitizeRagText(allChunks.get(chunkIdx));
-                if (!chunkContent.trim().isEmpty()) {
-                    chunkScores.put(chunkContent,
-                            chunkScores.getOrDefault(chunkContent, 0.0) + 1.0 / (k + i + 1));
+            // 2.处理BM25检索结果，增加已有chunk的分数
+            for (int i = 0; i < bm25ChunkIds.size(); i++) {
+                String chunkId = bm25ChunkIds.get(i);
+                if (chunkContents.containsKey(chunkId)) {
+                    chunkScores.put(chunkId,
+                            chunkScores.getOrDefault(chunkId, 0.0) + 1.0 / (k + i + 1));
                 }
             }
-        }
 
-        // 3.按RRF分数排序并返回topK个chunks
-        return chunkScores.entrySet().stream()
-                .sorted(Map.Entry.<String, Double>comparingByValue().reversed())
-                .limit(topK)
-                .map(Map.Entry::getKey)
-                .collect(Collectors.toList());
+            // 3.按RRF分数排序，获取topK个chunk IDs
+            List<String> topChunkIds = chunkScores.entrySet().stream()
+                    .sorted(Map.Entry.<String, Double>comparingByValue().reversed())
+                    .limit(topK)
+                    .map(Map.Entry::getKey)
+                    .collect(Collectors.toList());
+
+            // 4.根据chunk IDs获取对应的文本内容
+            List<String> results = new ArrayList<>();
+            for (String chunkId : topChunkIds) {
+                String content = chunkContents.get(chunkId);
+                if (content != null) {
+                    String docId = chunkToDocIds.get(chunkId);
+                    KnowledgeDocument doc = findDocById(docId);
+                    String title = doc != null ? doc.getTitle() : "";
+
+                    if (title.isEmpty()) {
+                        results.add(sanitizeRagText(content));
+                    } else {
+                        results.add("【" + title + "】\n" + sanitizeRagText(content));
+                    }
+                }
+            }
+
+            return results;
+        } finally {
+            readLock.unlock();
+        }
     }
 
-      private KnowledgeDocument findDocById(String id) {
+      /**
+     * 生成唯一的chunk ID
+     */
+    private String generateChunkId(String docId, int chunkIndex) {
+        return docId + "_chunk_" + chunkIndex;
+    }
+
+  /**
+     * 使用HanLP进行中文分词（用于BM25，支持中文）
+     */
+    private List<String> tokenizeWithHanLP(String text) {
+        if (text == null || text.trim().isEmpty()) {
+            return Collections.emptyList();
+        }
+
+        List<String> tokens = new ArrayList<>();
+        try {
+            // 使用HanLP进行分词，并过滤空字符串
+            for (com.hankcs.hanlp.seg.common.Term term : HanLP.segment(text)) {
+                if (term.word != null && !term.word.trim().isEmpty()) {
+                    tokens.add(term.word);
+                }
+                if (tokens.size() >= 1000) {
+                    break;
+                }
+            }
+        } catch (Exception e) {
+            log.warn("HanLP分词失败，回退到简单分词: {}", e.getMessage());
+            // 如果HanLP失败，回退到简单分词
+            return simpleTokenize(text);
+        }
+
+        return tokens;
+    }
+
+  /**
+     * 简单分词（用于BM25，支持中文）
+     */
+    private List<String> simpleTokenize(String text) {
+        List<String> tokens = new ArrayList<>();
+        // 匹配中文，英文单词，数字
+        Pattern pattern = Pattern.compile("[\\u4e00-\\u9fa5]|[a-zA-Z0-9]+");
+        Matcher matcher = pattern.matcher(text);
+        while (matcher.find()) {
+            tokens.add(matcher.group());
+        }
+        return tokens;
+    }
+
+    private KnowledgeDocument findDocById(String id) {
         return documents.stream().filter(d -> d.getId().equals(id)).findFirst().orElse(null);
     }
 
@@ -628,38 +758,23 @@ public class KnowledgeBaseService {
         }
 
         // 2.BM 25精准匹配，如果还是没有结果，使用BM25兜底
-        List<Integer> bm25ChunkIndices = Collections.emptyList();
+        List<String> bm25ChunkIds = Collections.emptyList();
         try {
-            if (!allChunks.isEmpty()) {
-                bm25ChunkIndices = searchBM25(query, topK);
-                log.info("BM25 search found {} chunks.", bm25ChunkIndices.size());
+            if (!chunkTermFreqs.isEmpty()) {
+                bm25ChunkIds = searchBM25(query, topK);
+                log.info("BM25 search found {} chunks.", bm25ChunkIds.size());
             }
         } catch (Exception e) {
             log.warn("【降级】BM25 检索异常，不中断流程: {}", e.getMessage());
         }
 
         // 3.双路召回失败，返回空列表
-        if (bm25ChunkIndices.isEmpty() && vectorResults.isEmpty()) {
+        if (bm25ChunkIds.isEmpty() && vectorResults.isEmpty()) {
             return Collections.emptyList();
         }
 
         // 4.使用RRF融合结果，直接返回chunks
-        return mergeAndRerankSnippets(vectorResults, bm25ChunkIndices, topK);
+        return mergeAndRerankSnippets(vectorResults, bm25ChunkIds, topK);
     }
 
-      /**
-     * 简单分词 (按空格和标点)
-     * 支持中文分词需要引入更复杂的库 (如 Jieba, HanLP)，这里使用正则简单处理
-     */
-    private List<String> tokenize(String text) {
-        // 匹配中文，英文单词，数字
-        List<String> tokens = new ArrayList<>();
-        // 创建正则表达式模具
-        Pattern pattern = Pattern.compile("[\\u4e00-\\u9fa5]|[a-zA-Z0-9]+");
-        Matcher matcher = pattern.matcher(text);
-        while (matcher.find()) {
-            tokens.add(matcher.group());
-        }
-        return tokens;
-    }
-}
+  }
