@@ -67,6 +67,45 @@ public class RabbitMQConfig {
         return BindingBuilder.bind(webhookQueue()).to(webhookExchange()).with(WEBHOOK_ROUTING_KEY);
     }
 
+    // ---- 上传队列 ----
+    public static final String UPLOAD_EXCHANGE    = "upload.exchange";
+    public static final String UPLOAD_QUEUE       = "upload.queue";
+    public static final String UPLOAD_ROUTING_KEY = "upload.file";
+    public static final String UPLOAD_DLX_EXCHANGE = "upload.dlx.exchange";
+    public static final String UPLOAD_DLQ_QUEUE = "upload.dlq.queue";
+    public static final String UPLOAD_DLQ_ROUTING_KEY = "upload.dlq.dead";
+    // 死信队列
+    @Bean
+    public DirectExchange uploadDLXExchange() {
+        return new DirectExchange(UPLOAD_DLX_EXCHANGE, true, false);
+    }
+    @Bean
+    public Queue uploadDLQQueue() {
+        return QueueBuilder.durable(UPLOAD_DLQ_QUEUE).build();
+    }
+    @Bean
+    public Binding uploadDLQBinding() {
+        return BindingBuilder.bind(uploadDLQQueue()).to(uploadDLXExchange()).with(UPLOAD_DLQ_ROUTING_KEY);
+    }
+
+    // 正常队列
+    @Bean
+    public DirectExchange uploadExchange() {
+        return new DirectExchange(UPLOAD_EXCHANGE, true, false);
+    }
+    @Bean
+    public Queue uploadQueue() {
+        return QueueBuilder.durable(UPLOAD_QUEUE)
+                .withArgument("x-dead-letter-exchange", UPLOAD_DLX_EXCHANGE)
+                .withArgument("x-dead-letter-routing-key", UPLOAD_DLQ_ROUTING_KEY)
+                .withArgument("x-message-ttl", 1800000)
+                .build();
+    }
+    @Bean
+    public Binding uploadBinding() {
+        return BindingBuilder.bind(uploadQueue()).to(uploadExchange()).with(UPLOAD_ROUTING_KEY);
+    }
+
     // ---- CI/CD 队列 ----
     public static final String CICD_EXCHANGE    = "cicd.exchange";
     public static final String CICD_QUEUE       = "cicd.queue";

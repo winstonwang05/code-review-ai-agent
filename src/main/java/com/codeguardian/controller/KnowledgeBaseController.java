@@ -1,6 +1,7 @@
 package com.codeguardian.controller;
 
 import cn.dev33.satoken.annotation.SaCheckPermission;
+import com.codeguardian.mq.UploadMessageProducer;
 import com.codeguardian.service.rag.KnowledgeBaseService;
 import com.codeguardian.service.rag.KnowledgeDocument;
 import com.codeguardian.util.ViewModelUtils;
@@ -32,6 +33,7 @@ import java.util.Map;
 public class KnowledgeBaseController {
 
     private final KnowledgeBaseService knowledgeBaseService;
+    private final UploadMessageProducer uploadMessageProducer;
 
     @GetMapping
     @SaCheckPermission("ADMIN")
@@ -101,9 +103,8 @@ public class KnowledgeBaseController {
         }
         
         try {
-            // Support generic document upload (Tika handles formats)
-            knowledgeBaseService.uploadDocument(file);
-            redirectAttributes.addFlashAttribute("success", "文档上传成功并已处理");
+            uploadMessageProducer.send(file);
+            redirectAttributes.addFlashAttribute("success", "文档上传成功，正在后台处理中");
         } catch (Exception e) {
             log.error("Upload failed", e);
             redirectAttributes.addFlashAttribute("error", "上传失败: " + e.getMessage());
