@@ -39,6 +39,13 @@ public class AIConfigProperties {
      */
     private Integer maxRetries = 3;
 
+    /**
+     * 所有 AI 提供商均不可用时是否抛出异常（触发重试队列/本地重试）
+     * false（默认）：静默返回空结果，保证流程高可用，代价是该单元无审查结果
+     * true          ：抛出异常，Webhook 进入重试队列，CI/CD 本地重试，安全性优先
+     */
+    private Boolean failOnUnavailable = false;
+
 
     /**
      * 各模型提供商的独立配置

@@ -13,7 +13,8 @@ import lombok.Data;
 @Builder
 public class CicdStatusResponse {
     private Long taskId;
-    private String status; // RUNNING, COMPLETED, FAILED
+    private String taskKey;  // CI/CD 任务唯一标识（如 CI-JENKINS-1234567890）
+    private String status; // PENDING, PARSING, REVIEWING, COMPLETED, FAILED, TIMEOUT
     private boolean passed; // 是否通过门禁
     private String message;
     private String reportUrl;

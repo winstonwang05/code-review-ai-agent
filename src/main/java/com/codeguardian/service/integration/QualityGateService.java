@@ -41,7 +41,7 @@ public class QualityGateService {
         return checkQualityGate(findings, blockOn, taskId);
     }
 
-    boolean checkQualityGate(List<Finding> findings, String blockOn) {
+    public boolean checkQualityGate(List<Finding> findings, String blockOn) {
         return checkQualityGate(findings, blockOn, null);
     }
 

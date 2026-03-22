@@ -9,6 +9,7 @@ import org.springframework.web.client.RestClient;
 
 import java.net.URLEncoder;
 import java.nio.charset.StandardCharsets;
+import java.util.List;
 import java.util.Map;
 
 /**
@@ -112,6 +113,46 @@ public class GitFeedbackService {
             log.info("成功更新 GitCode 状态");
         } catch (Exception e) {
             log.error("更新 GitCode 状态失败: {}", e.getMessage());
+        }
+    }
+
+    /**
+     * 幂等检查：查询 MR 评论列表，判断是否已存在包含指定关键词的评论
+     * 用于防止 ACK 失败重投后重复写评论
+     *
+     * @param gitUrl    仓库 URL
+     * @param prNumber  MR IID
+     * @param keyword   评论关键词（如 "CodeGuardian AI 审查报告"）
+     * @return true=已存在，false=不存在或查询失败
+     */
+    public boolean hasComment(String gitUrl, String prNumber, String keyword) {
+        if (token == null || token.isEmpty()) {
+            return false;
+        }
+        try {
+            String projectPath = extractProjectPath(gitUrl);
+            String encodedPath = URLEncoder.encode(projectPath, StandardCharsets.UTF_8);
+            String uri = String.format("/projects/%s/merge_requests/%s/notes?per_page=20", encodedPath, prNumber);
+
+            // 返回评论列表，每条评论包含 body 字段
+            List<Map<String, Object>> notes = restClientBuilder.baseUrl(baseUrl)
+                    .build()
+                    .get()
+                    .uri(uri)
+                    .header("PRIVATE-TOKEN", token)
+                    .retrieve()
+                    .body(new org.springframework.core.ParameterizedTypeReference<List<Map<String, Object>>>() {});
+
+            if (notes == null) return false;
+
+            return notes.stream()
+                    .anyMatch(note -> {
+                        Object body = note.get("body");
+                        return body instanceof String s && s.contains(keyword);
+                    });
+        } catch (Exception e) {
+            log.warn("查询 GitCode 评论列表失败，默认返回 false: {}", e.getMessage());
+            return false;
         }
     }
 

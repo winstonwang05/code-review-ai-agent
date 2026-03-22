@@ -1,6 +1,7 @@
 package com.codeguardian.service.rag;
 
 import com.codeguardian.repository.KnowledgeDocumentRepository;
+import com.codeguardian.service.diff.SemanticFingerprintService;
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.hankcs.hanlp.HanLP;
@@ -22,9 +23,7 @@ import org.springframework.data.domain.Sort;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.stereotype.Service;
 import org.springframework.web.multipart.MultipartFile;
-
 import com.codeguardian.config.SearchConfig;
-import com.codeguardian.util.DocumentProcessor;
 import java.io.IOException;
 import java.io.InputStream;
 import java.util.*;
@@ -52,6 +51,7 @@ public class KnowledgeBaseService {
     private final KnowledgeDocumentRepository repository;
     private final MinioStorageService minioStorageService;
     private final JdbcTemplate jdbcTemplate;
+    private final SemanticFingerprintService fingerprintService;
 
     // 读写锁，用于保护索引的并发访问
     private final ReentrantReadWriteLock rwLock = new ReentrantReadWriteLock();
@@ -512,7 +512,7 @@ public class KnowledgeBaseService {
     private List<String> searchBM25(String query, int topK) {
         readLock.lock();
         try {
-            // 1.先将用户的问题拆分分块并遍历
+            // 1.先将代码拆分分块并遍历
             List<String> queryTerms = tokenizeWithHanLP(query.toLowerCase());
 
             Map<String, Double> scores = new HashMap<>();
@@ -694,7 +694,7 @@ public class KnowledgeBaseService {
     }
 
   /**
-     * 使用HanLP进行中文分词（用于BM25，支持中文）
+     * 使用HanLP进行中文分词，同时处理英文（用于BM25，支持中英文）
      */
     private List<String> tokenizeWithHanLP(String text) {
         if (text == null || text.trim().isEmpty()) {
@@ -703,7 +703,7 @@ public class KnowledgeBaseService {
 
         List<String> tokens = new ArrayList<>();
         try {
-            // 使用HanLP进行分词，并过滤空字符串
+            // 第一步：使用HanLP进行分词，主要处理中文
             for (com.hankcs.hanlp.seg.common.Term term : HanLP.segment(text)) {
                 if (term.word != null && !term.word.trim().isEmpty()) {
                     tokens.add(term.word);
@@ -712,25 +712,67 @@ public class KnowledgeBaseService {
                     break;
                 }
             }
+
+            // 第二步：无论HanLP处理了什么，都使用正则表达式重新提取英文
+            // 这样可以确保所有英文单词都被正确识别，包括HanLP可能遗漏或处理不当的
+            List<String> englishTokens = extractEnglishWords(text);
+
+            // 过滤掉已经存在的英文单词（HanLP可能已经识别的）
+            for (String englishToken : englishTokens) {
+                if (!tokens.contains(englishToken)) {
+                    tokens.add(englishToken);
+                }
+            }
         } catch (Exception e) {
             log.warn("HanLP分词失败，回退到简单分词: {}", e.getMessage());
-            // 如果HanLP失败，回退到简单分词
+            // 如果HanLP失败，回退到改进的简单分词
             return simpleTokenize(text);
         }
 
         return tokens;
     }
 
-  /**
-     * 简单分词（用于BM25，支持中文）
+    /**
+     * 简单分词（用于BM25，支持中英文）
      */
     private List<String> simpleTokenize(String text) {
         List<String> tokens = new ArrayList<>();
-        // 匹配中文，英文单词，数字
-        Pattern pattern = Pattern.compile("[\\u4e00-\\u9fa5]|[a-zA-Z0-9]+");
+
+        // 匹配中文字符
+        Pattern chinesePattern = Pattern.compile("[\\u4e00-\\u9fa5]+");
+        Matcher chineseMatcher = chinesePattern.matcher(text);
+        while (chineseMatcher.find()) {
+            tokens.add(chineseMatcher.group());
+        }
+
+        // 匹配英文单词（包含连字符和撇号）
+        Pattern englishPattern = Pattern.compile("[a-zA-Z]+(?:[-'][a-zA-Z]+)*");
+        Matcher englishMatcher = englishPattern.matcher(text);
+        while (englishMatcher.find()) {
+            tokens.add(englishMatcher.group().toLowerCase());
+        }
+
+        // 匹配数字（独立存在或与其他单词组合）
+        Pattern numberPattern = Pattern.compile("\\b\\d+(?:\\.\\d+)?\\b");
+        Matcher numberMatcher = numberPattern.matcher(text);
+        while (numberMatcher.find()) {
+            tokens.add(numberMatcher.group());
+        }
+
+        return tokens;
+    }
+
+    /**
+     * 提取英文单词（保留连字符和撇号）
+     */
+    private List<String> extractEnglishWords(String text) {
+        List<String> tokens = new ArrayList<>();
+        // 使用正则表达式匹配英文单词，包括连字符和撇号
+        Pattern pattern = Pattern.compile("[a-zA-Z]+(?:[-'][a-zA-Z]+)*");
         Matcher matcher = pattern.matcher(text);
         while (matcher.find()) {
-            tokens.add(matcher.group());
+            // 转换为小写，确保检索时不区分大小写
+            tokens.add(matcher.group().toLowerCase());
         }
         return tokens;
     }

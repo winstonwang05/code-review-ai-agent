@@ -14,6 +14,7 @@ import com.codeguardian.repository.FindingRepository;
 import com.codeguardian.repository.ReviewTaskRepository;
 import com.codeguardian.service.GitService;
 import com.codeguardian.service.ReviewService;
+import com.codeguardian.service.SystemConfigService;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.data.domain.Page;
@@ -37,7 +38,7 @@ import java.util.stream.Collectors;
  * @version: 1.0
  */
 @RestController
-@RequestMapping("/api/review")
+@RequestMapping("/api/v1/review")
 @RequiredArgsConstructor
 @Slf4j
 public class ReviewController {
@@ -45,6 +46,7 @@ public class ReviewController {
     private final ReviewTaskRepository taskRepository;
     private final FindingRepository findingRepository;
     private final GitService gitService;
+    private final SystemConfigService configService;
 
 
 

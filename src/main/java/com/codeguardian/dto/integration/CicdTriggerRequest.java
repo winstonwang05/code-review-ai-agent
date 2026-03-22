@@ -10,4 +10,5 @@ public class CicdTriggerRequest {
     private String triggerBy; // e.g., "JENKINS", "GITLAB_CI"
     private String projectPath; // 可选，指定子目录
     private String blockOn; // 阻断级别
+    private Integer mrIid; // MR/PR 内部编号，用于 Diff API 拉取
 }
