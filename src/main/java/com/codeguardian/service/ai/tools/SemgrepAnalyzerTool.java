@@ -7,6 +7,7 @@ import com.fasterxml.jackson.annotation.JsonProperty;
 import com.fasterxml.jackson.annotation.JsonPropertyDescription;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.codeguardian.service.ai.tool.ToolInput;
 import lombok.Data;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
@@ -34,6 +35,7 @@ import java.util.stream.Collectors;
 @Slf4j
 @Component("semgrepAnalysis")
 @Description("使用Semgrep（或回退规则）扫描代码中的安全漏洞")
+@ToolInput(SemgrepAnalyzerTool.Request.class)
 @RequiredArgsConstructor
 public class SemgrepAnalyzerTool implements Function<SemgrepAnalyzerTool.Request, SemgrepAnalyzerTool.Response> {
 

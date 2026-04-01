@@ -72,41 +72,22 @@ public class ToolRegistry {
      */
     private void registerFunctionBean(String name, Function<?, ?> function, String description) {
         try {
-            // 1.由于泛型擦除，工具处理的Request模板被擦除，所以需要获取
-            Class<?> inputType = Object.class;
+            // 1.由于泛型擦除（尤其是 CGLIB 代理和 Lambda），运行时无法直接获取 Function<I, O> 中的 I
+            //   采用三级策略解析输入类型，符合 OCP 原则——新增工具只需加 @ToolInput 注解，无需修改此处
 
-            // 1.1从工具注册的bean的name尝试获取
-            if (name.equals("javaSyntaxAnalysis")) {
-                inputType = com.codeguardian.service.ai.tools.JavaSyntaxAnalyzerTool.Request.class;
-            } else if (name.equals("semgrepAnalysis")) {
-                inputType = com.codeguardian.service.ai.tools.SemgrepAnalyzerTool.Request.class;
-            } else {
-                // 1.2还是不行，直接通过反射机制获取工具的实现的接口获取参数（Request模板）
-                try {
-                    // 获取工具实现所有接口
-                    Type[] genericInterfaces = function.getClass().getGenericInterfaces();
-                    for (Type type : genericInterfaces) {
-                        // 找到实现Function接口
-                        if (type instanceof ParameterizedType) {
-                            ParameterizedType pt = (ParameterizedType) type;
-                            if (pt.getRawType().equals(Function.class)) {
-                                // 获取Function接口的第一个参数也就是Request
-                                Type[] args = pt.getActualTypeArguments();
-                                if (args.length > 0 && args[0] instanceof Class) {
-                                    inputType = (Class<?>) args[0];
-                                    break;
-                                }
-                            }
-                        }
-                    }
-                    if (inputType == Object.class) {
-                        log.warn("未知函数 Bean {}, 跳过 Schema 生成", name);
-                        return;
-                    }
-                } catch (Exception e) {
-                    log.warn("无法推断 {} 的输入类型, 跳过", name);
-                    return;
-                }
+            // 策略一：优先从 @ToolInput 注解获取（推荐，OCP 友好，不受代理影响）
+            Class<?> inputType = resolveInputTypeFromAnnotation(function);
+
+            // 策略二：注解不存在时，通过反射解析 Function 接口的泛型参数
+            //         对直接实现类有效，但 CGLIB 代理类/Lambda 可能失败
+            if (inputType == null) {
+                inputType = resolveInputTypeFromGenericInterface(function);
+            }
+
+            // 两种策略都失败，跳过注册
+            if (inputType == null) {
+                log.warn("无法推断工具 {} 的输入类型（未标注 @ToolInput 且反射解析失败），跳过注册", name);
+                return;
             }
 
 
@@ -123,10 +104,60 @@ public class ToolRegistry {
                             .build())
                     .build();
             tools.put(name, new ToolWrapper(toolDefinition, function, inputType));
-            log.info("已注册工具: {}", name);
+            log.info("已注册工具: {} (inputType={})", name, inputType.getSimpleName());
         } catch (Exception e) {
             log.error("注册工具 {} 失败", name, e);
         }
+    }
+
+    /**
+     * 策略一：从 @ToolInput 注解获取输入类型
+     * 优先检查原始类（处理 CGLIB 代理场景：代理类名包含 $$，需要获取其父类即原始类）
+     *
+     * @param function 工具 Bean 实例
+     * @return 输入类型，未找到注解返回 null
+     */
+    private Class<?> resolveInputTypeFromAnnotation(Function<?, ?> function) {
+        Class<?> clazz = function.getClass();
+
+        // CGLIB 代理类的类名包含 $$，其父类才是原始类
+        if (clazz.getName().contains("$$")) {
+            clazz = clazz.getSuperclass();
+        }
+
+        ToolInput toolInput = clazz.getAnnotation(ToolInput.class);
+        if (toolInput != null) {
+            log.debug("从 @ToolInput 注解获取输入类型: {}", toolInput.value().getSimpleName());
+            return toolInput.value();
+        }
+        return null;
+    }
+
+    /**
+     * 策略二：通过反射解析 Function 接口的泛型参数获取输入类型
+     * 对直接实现类有效，但 CGLIB 代理类和 Lambda 表达式可能无法获取 ParameterizedType
+     *
+     * @param function 工具 Bean 实例
+     * @return 输入类型，解析失败返回 null
+     */
+    private Class<?> resolveInputTypeFromGenericInterface(Function<?, ?> function) {
+        try {
+            Type[] genericInterfaces = function.getClass().getGenericInterfaces();
+            for (Type type : genericInterfaces) {
+                if (type instanceof ParameterizedType pt) {
+                    if (pt.getRawType().equals(Function.class)) {
+                        Type[] args = pt.getActualTypeArguments();
+                        if (args.length > 0 && args[0] instanceof Class<?> inputClass) {
+                            log.debug("从泛型接口反射获取输入类型: {}", inputClass.getSimpleName());
+                            return inputClass;
+                        }
+                    }
+                }
+            }
+        } catch (Exception e) {
+            log.warn("反射解析工具 {} 的泛型接口失败: {}", function.getClass().getSimpleName(), e.getMessage());
+        }
+        return null;
     }
 
     /**

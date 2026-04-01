@@ -10,6 +10,7 @@ import com.github.javaparser.ast.CompilationUnit;
 import com.github.javaparser.ast.body.ClassOrInterfaceDeclaration;
 import com.github.javaparser.ast.body.MethodDeclaration;
 import com.github.javaparser.ast.expr.MethodCallExpr;
+import com.codeguardian.service.ai.tool.ToolInput;
 import lombok.Data;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.context.annotation.Description;
@@ -29,6 +30,7 @@ import java.util.stream.Collectors;
  */
 @Component("javaSyntaxAnalysis")
 @Description("使用JavaParser分析Java代码的语法结构和错误")
+@ToolInput(JavaSyntaxAnalyzerTool.Request.class)
 @Slf4j
 public class JavaSyntaxAnalyzerTool implements Function<JavaSyntaxAnalyzerTool.Request, JavaSyntaxAnalyzerTool.Response> {
     /**
